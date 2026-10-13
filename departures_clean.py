@@ -8,6 +8,8 @@ Requires the `requests` package. Run with:
     python departures_clean.py
 
 Edit the constants below to change the stop or target direction.
+`find_station` and `get_departures` return data instead of printing,
+so they can be reused (e.g. by the Streamlit app in app.py).
 """
 
 from datetime import datetime
@@ -20,8 +22,67 @@ START = "Bundeswehrkrankenhaus, Berlin"
 DESTINATION = "Hauptbahnhof, Berlin"
 BUS_LINE = "120"
 
-# Departures whose direction contains this text are printed.
+# Departures whose direction contains this text are shown.
 DIRECTION_FILTER = "Hauptbahnhof"
+
+# Errors that the fetch functions can raise for network/API problems.
+FETCH_ERRORS = (requests.RequestException, ValueError, KeyError)
+
+
+def find_station(query):
+    """Return the best-matching station for `query` as a dict with "id" and "name".
+
+    Only stations are requested (no addresses or points of interest).
+    Raises one of FETCH_ERRORS on failure.
+    """
+    response = requests.get(
+        f"{API_URL}/locations",
+        params={"query": query, "results": 1, "addresses": False, "poi": False},
+        timeout=20,
+    )
+    response.raise_for_status()
+    stations = response.json()
+    if not stations:
+        raise ValueError("No matching station found.")
+    return stations[0]
+
+
+def get_departures(station_id, direction_filter=DIRECTION_FILTER):
+    """Return upcoming departures from `station_id` towards `direction_filter`.
+
+    Each departure is a dict: {"time": "HH:MM", "line": ..., "direction": ...}.
+    Covers the next 30 minutes, at most 5 departures. The direction filter is
+    applied after this cap, so fewer than 5 (or none) may be returned.
+    Raises one of FETCH_ERRORS on failure.
+    """
+    response = requests.get(
+        f"{API_URL}/stops/{station_id}/departures",
+        params={"duration": 30, "results": 5},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    departures = []
+    for departure in response.json()["departures"]:
+        direction = departure.get("direction") or ""
+        if departure.get("cancelled") or direction_filter not in direction:
+            continue
+
+        # Prefer the real-time time ("when"); fall back to the schedule.
+        timestamp = departure.get("when") or departure.get("plannedWhen")
+        if not timestamp:
+            continue
+
+        try:
+            # Timestamps carry Berlin's UTC offset; only reformat, don't convert.
+            time = datetime.fromisoformat(timestamp).strftime("%H:%M")
+        except ValueError:
+            continue  # Skip departures with an unparseable timestamp.
+
+        departures.append(
+            {"time": time, "line": departure["line"]["name"], "direction": direction}
+        )
+    return departures
 
 
 def get_bvg_departures(start):
@@ -31,50 +92,11 @@ def get_bvg_departures(start):
     Network/API errors are caught and printed, not raised.
     """
     try:
-        # Step 1: resolve the stop name to a station. Only stations are
-        # requested (no addresses or points of interest); the best match is used.
-        response = requests.get(
-            f"{API_URL}/locations",
-            params={"query": start, "results": 1, "addresses": False, "poi": False},
-            timeout=20,
-        )
-        response.raise_for_status()
-        stations = response.json()
-        if not stations:
-            raise ValueError("No matching station found.")
-
-        station = stations[0]
+        station = find_station(start)
         print(f"Departures from: {station['name']}")
-
-        # Step 2: fetch departures for the next 30 minutes, at most 5.
-        # The direction filter is applied after this cap, so fewer than
-        # 5 lines (or none) may be printed.
-        response = requests.get(
-            f"{API_URL}/stops/{station['id']}/departures",
-            params={"duration": 30, "results": 5},
-            timeout=20,
-        )
-        response.raise_for_status()
-
-        for departure in response.json()["departures"]:
-            if departure.get("cancelled"):
-                continue
-            if DIRECTION_FILTER not in departure.get("direction", ""):
-                continue
-
-            # Prefer the real-time time ("when"); fall back to the schedule.
-            timestamp = departure.get("when") or departure.get("plannedWhen")
-            if not timestamp:
-                continue
-
-            try:
-                time = datetime.fromisoformat(timestamp).strftime("%H:%M")
-            except ValueError:
-                continue  # Skip departures with an unparseable timestamp.
-
-            print(f"{time}  {departure['line']['name']} → {DIRECTION_FILTER}")
-
-    except (requests.RequestException, ValueError, KeyError) as e:
+        for departure in get_departures(station["id"]):
+            print(f"{departure['time']}  {departure['line']} → {DIRECTION_FILTER}")
+    except FETCH_ERRORS as e:
         print(f"Error fetching BVG data: {e}")
 
 
